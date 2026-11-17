@@ -1,22 +1,3 @@
-"""Command-line interface for the sequential download speed test.
-
-The CLI is a thin layer over the existing service: downloads, timing and
-statistics all come from ``SpeedTester`` in ``app.services.speed_tester``, and
-URL / request-count validation reuses ``SpeedTestRequest`` from
-``app.schemas.speed_test``. The same code path therefore serves both this CLI
-and the ``POST /api/speed-test`` endpoint.
-
-Usage::
-
-    python -m app.cli https://example.com/large-image.jpg
-    python -m app.cli https://example.com/large-image.jpg -n 10
-
-Exit codes:
-    0  every request succeeded
-    1  at least one request failed, or the test could not run (SSRF block, unexpected error)
-    2  invalid arguments (malformed URL, requests count out of range)
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -65,31 +46,44 @@ def _fmt_or_na(value: float, fmt: str, has_data: bool) -> str:
     return format(value, fmt) if has_data else "n/a"
 
 
+SEPARATOR = "─" * 29
+
+
 def format_report(summary: SpeedTestSummary) -> list[str]:
-    """Render a SpeedTestSummary as human-readable console lines."""
+    """Render a SpeedTestSummary as the console report.
+
+    Download speed is the overall throughput (total MiB / total seconds),
+    matching the ``overall_speed_mib_s`` field of the API.
+    """
+    total = summary.total_requests
     has_data = summary.successful_requests > 0
 
-    lines = [f"URL: {summary.url}", ""]
+    lines = ["INTERNET SPEED TEST", SEPARATOR]
 
     for result in summary.results:
-        prefix = f"Request {result.request_number:>2}:"
+        label = f"[{result.request_number}/{total}]"
         if result.success:
             lines.append(
-                f"{prefix} {result.duration_seconds:.3f} s, "
-                f"{result.size_mib:.2f} MiB, {result.speed_mib_s:.2f} MiB/s"
+                f"{label:<8}Downloaded {result.size_mib:.2f} MiB in {result.duration_seconds:.3f} s"
             )
         else:
-            lines.append(f"{prefix} FAILED ({result.error})")
+            lines.append(f"{label:<8}FAILED ({result.error})")
+
+    status = "SUCCESS" if summary.failed_requests == 0 else "FAILED"
 
     lines += [
         "",
-        f"Requests: {summary.total_requests} total, "
-        f"{summary.successful_requests} successful, {summary.failed_requests} failed",
+        SEPARATOR,
+        "RESULTS",
+        "",
+        f"Successful requests: {summary.successful_requests}/{total}",
         f"Average request time: {_fmt_or_na(summary.average_time_seconds, '.3f', has_data)} s",
-        f"Total downloaded: {summary.total_size_mib:.2f} MiB ({summary.total_bytes} bytes)",
-        f"Total download time: {summary.total_time_seconds:.3f} s",
-        f"Average speed: {_fmt_or_na(summary.average_speed_mib_s, '.2f', has_data)} MiB/s",
-        f"Overall speed: {_fmt_or_na(summary.overall_speed_mib_s, '.2f', has_data)} MiB/s",
+        f"Total downloaded: {summary.total_size_mib:.2f} MiB",
+        f"Total download time: {summary.total_time_seconds:.2f} s",
+        f"Download speed: {_fmt_or_na(summary.overall_speed_mib_s, '.2f', has_data)} MiB/s",
+        "",
+        f"Status: {status}",
+        SEPARATOR,
     ]
     return lines
 
