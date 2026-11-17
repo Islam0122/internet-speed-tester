@@ -8,7 +8,12 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.config import settings
 from app.schemas.speed_test import RequestResult, SpeedTestRequest, SpeedTestResponse
-from app.services.speed_tester import SpeedTester, SpeedTestTimeoutError, SSRFError
+from app.services.speed_tester import (
+    SpeedTester,
+    SpeedTestTimeoutError,
+    SSRFError,
+    redact_url,
+)
 
 logger = logging.getLogger("app.api.speed_test")
 
@@ -87,10 +92,12 @@ async def run_speed_test(
     try:
         summary = await tester.run(payload.url, payload.requests_count)
     except SSRFError as exc:
-        # Do not leak internal resolution details beyond what's useful to the client.
+        # The API does not reveal which address was resolved or why. The
+        # detailed reason is logged on the server, and the CLI still shows it.
+        logger.info("Rejected target %s: %s", redact_url(payload.url), exc)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"URL is not allowed: {exc}",
+            detail="URL is not allowed: the host is not a public address or could not be resolved.",
         ) from exc
     except SpeedTestTimeoutError as exc:
         raise HTTPException(
@@ -98,7 +105,9 @@ async def run_speed_test(
             detail=str(exc),
         ) from exc
     except Exception as exc:  # noqa: BLE001 - guard against any unexpected failure.
-        logger.exception("Unexpected error while running speed test for %s", payload.url)
+        logger.exception(
+            "Unexpected error while running speed test for %s", redact_url(payload.url)
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An unexpected error occurred while running the speed test.",

@@ -31,12 +31,24 @@ class SpeedTestRequest(BaseModel):
     @classmethod
     def validate_url(cls, value: str) -> str:
         value = value.strip()
+        if any(char.isspace() for char in value):
+            raise ValueError("URL must not contain whitespace.")
+
         parsed = urlparse(value)
 
         if parsed.scheme.lower() not in ALLOWED_SCHEMES:
             raise ValueError("URL scheme must be 'http' or 'https'.")
 
         if not parsed.netloc:
+            raise ValueError("URL must include a valid host.")
+
+        # Checked on the raw netloc, so "user@host" and "user:pass@host" are
+        # both rejected. Credentials must not be sent to the target host, and
+        # they would otherwise appear in logs and responses.
+        if "@" in parsed.netloc:
+            raise ValueError("URL must not contain a username or password.")
+
+        if not parsed.hostname:
             raise ValueError("URL must include a valid host.")
 
         return value
@@ -89,14 +101,16 @@ class SpeedTestResponse(BaseModel):
     average_speed_mib_s: float = Field(
         ...,
         description=(
-            "Mean of each successful request's own speed_mib_s (average of per-request rates)."
+            "Mean of speed_mib_s over successful requests that downloaded at least one "
+            "byte. Empty successful bodies are excluded. 0.0 if no request downloaded data."
         ),
     )
     overall_speed_mib_s: float = Field(
         ...,
         description=(
             "total_size_mib / total_time_seconds - overall throughput across "
-            "all successful requests treated as one continuous transfer."
+            "all successful requests treated as one continuous transfer. "
+            "0.0 if no bytes were received."
         ),
     )
 

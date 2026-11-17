@@ -258,3 +258,25 @@ def test_help_exits_zero(capsys):
 
     assert exit_code == EXIT_OK
     assert "requests" in capsys.readouterr().out
+
+
+def test_cli_default_stays_ten_when_env_default_differs(monkeypatch, capsys):
+    """DEFAULT_REQUESTS_COUNT changes only the API default; the CLI standard run is 10."""
+    monkeypatch.setattr(settings, "default_requests_count", 3)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return streamed_response(200, content=b"x" * 100)
+
+    assert build_parser().parse_args([URL]).requests_count == 10
+    exit_code = main([URL], tester_factory=_factory(handler))
+
+    assert exit_code == EXIT_OK
+    assert calls["n"] == 10
+    assert "Successful requests: 10/10" in capsys.readouterr().out
+
+
+def test_cli_explicit_count_still_overrides_default(monkeypatch):
+    monkeypatch.setattr(settings, "default_requests_count", 3)
+    assert build_parser().parse_args([URL, "-n", "7"]).requests_count == 7
