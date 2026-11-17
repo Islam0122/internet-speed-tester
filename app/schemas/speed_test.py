@@ -89,7 +89,7 @@ class SpeedTestResponse(BaseModel):
     average_speed_mib_s: float = Field(
         ...,
         description=(
-            "Mean of each successful request's own speed_mib_s " "(average of per-request rates)."
+            "Mean of each successful request's own speed_mib_s (average of per-request rates)."
         ),
     )
     overall_speed_mib_s: float = Field(
