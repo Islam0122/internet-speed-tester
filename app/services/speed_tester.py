@@ -7,20 +7,27 @@ Design notes
 * Timing uses ``time.perf_counter()`` around the *entire* streamed download,
   not just the time to receive headers, so ``duration_seconds`` reflects the
   full transfer.
-* Bytes are counted from the chunks actually read off the wire. The
-  ``Content-Length`` header is never trusted for the byte count.
-* A best-effort SSRF guard resolves the target host and rejects private,
-  loopback, link-local, and other non-public IP ranges before connecting.
-  This is a defense-in-depth measure, not a complete guarantee - see the
-  README "Security" section for its documented limitations (e.g. it does not
-  protect against DNS rebinding between the check and the actual connection).
+* ``Accept-Encoding: identity`` is requested and the bytes are counted from
+  the raw body (``aiter_raw``), so the count is the number of bytes that
+  actually crossed the network, never ``Content-Length`` and never the size
+  after decompression.
+* Redirects are not followed. A 3xx response is reported as a failed request.
+  This keeps the SSRF check meaningful: every request targets exactly the URL
+  that was validated.
+* A best-effort SSRF guard resolves the host without blocking the event loop
+  and rejects non-public IP ranges. It does not protect against DNS rebinding,
+  because the name is resolved again when the connection is opened. See the
+  README "Security" section.
+* ``TOTAL_TIMEOUT_SECONDS`` bounds the whole test, not only each request.
 """
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import socket
 import time
+from contextlib import aclosing
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -30,9 +37,21 @@ from app.config import settings
 
 BYTES_PER_MIB = 1024 * 1024
 
+# Ranges that must not be treated as public. ``ipaddress.is_private`` does not
+# cover all of them (for example the carrier-grade NAT range, which hosts the
+# Alibaba Cloud metadata endpoint 100.100.100.200).
+_EXTRA_BLOCKED_NETWORKS = tuple(
+    ipaddress.ip_network(net)
+    for net in ("100.64.0.0/10", "198.18.0.0/15", "192.0.0.0/24", "240.0.0.0/4")
+)
+
 
 class SSRFError(Exception):
     """Raised when a target host resolves to a disallowed IP address."""
+
+
+class SpeedTestTimeoutError(Exception):
+    """Raised when the whole test exceeds ``TOTAL_TIMEOUT_SECONDS``."""
 
 
 @dataclass
@@ -53,22 +72,29 @@ def _is_disallowed_ip(ip_str: str) -> bool:
     except ValueError:
         return True  # Unparsable address: fail closed.
 
-    return (
+    # ::ffff:a.b.c.d must be judged by its IPv4 address.
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+
+    if (
         ip.is_private
         or ip.is_loopback
         or ip.is_link_local
         or ip.is_multicast
         or ip.is_reserved
         or ip.is_unspecified
-        # Common cloud metadata endpoint (169.254.169.254) is already caught
-        # by is_link_local, kept here for clarity/documentation purposes.
-    )
+    ):
+        return True
+
+    return any(ip in network for network in _EXTRA_BLOCKED_NETWORKS)
 
 
-def check_host_is_public(url: str) -> None:
+async def check_host_is_public(url: str) -> None:
     """Resolve the URL's host and raise SSRFError if it is not publicly routable.
 
-    No-op when ``settings.enable_ssrf_protection`` is False.
+    Name resolution uses the event loop's executor, so a slow DNS server does
+    not block other requests. No-op when ``settings.enable_ssrf_protection``
+    is False.
     """
     if not settings.enable_ssrf_protection:
         return
@@ -78,7 +104,7 @@ def check_host_is_public(url: str) -> None:
         raise SSRFError("URL has no resolvable host.")
 
     try:
-        infos = socket.getaddrinfo(hostname, None)
+        infos = await asyncio.get_running_loop().getaddrinfo(hostname, None)
     except socket.gaierror as exc:
         raise SSRFError(f"Could not resolve host '{hostname}': {exc}") from exc
 
@@ -104,15 +130,29 @@ async def _perform_single_download(client: httpx.AsyncClient, url: str) -> Singl
     try:
         async with client.stream("GET", url) as response:
             status_code = response.status_code
+
+            if 300 <= status_code < 400:
+                # Redirects are deliberately not followed (see module docstring).
+                return SingleRequestOutcome(
+                    success=False,
+                    status_code=status_code,
+                    duration_seconds=time.perf_counter() - start,
+                    bytes_downloaded=0,
+                    error=f"Redirect not followed: HTTP {status_code}",
+                )
+
             response.raise_for_status()
 
-            async for chunk in response.aiter_bytes(settings.chunk_size_bytes):
-                bytes_downloaded += len(chunk)
-                if bytes_downloaded > settings.max_response_bytes:
-                    raise MaxResponseSizeExceeded(
-                        f"Response exceeded the maximum allowed size of "
-                        f"{settings.max_response_bytes} bytes."
-                    )
+            # aclosing() releases the body generator even when we stop early
+            # (size cap exceeded) instead of leaving it to the garbage collector.
+            async with aclosing(response.aiter_raw(settings.chunk_size_bytes)) as chunks:
+                async for chunk in chunks:
+                    bytes_downloaded += len(chunk)
+                    if bytes_downloaded > settings.max_response_bytes:
+                        raise MaxResponseSizeExceeded(
+                            f"Response exceeded the maximum allowed size of "
+                            f"{settings.max_response_bytes} bytes."
+                        )
 
         duration = time.perf_counter() - start
         return SingleRequestOutcome(
@@ -197,28 +237,32 @@ class SpeedTester:
     async def run(self, url: str, requests_count: int) -> SpeedTestSummary:
         """Execute ``requests_count`` sequential GET downloads against ``url``.
 
-        Requests are performed strictly one after another; no concurrency is
-        used, matching the assignment's requirement.
-
         Raises:
             SSRFError: if the host resolves to a disallowed IP address.
+            SpeedTestTimeoutError: if the whole test exceeds TOTAL_TIMEOUT_SECONDS.
         """
         if not self._skip_ssrf_check:
-            check_host_is_public(url)
+            await check_host_is_public(url)
 
         outcomes: list[SingleRequestOutcome] = []
 
         limits = httpx.Limits(max_connections=1, max_keepalive_connections=1)
-        async with httpx.AsyncClient(
-            timeout=self._timeout,
-            limits=limits,
-            follow_redirects=True,
-            max_redirects=settings.max_redirects,
-            transport=self._transport,
-        ) as client:
-            for _ in range(requests_count):
-                outcome = await _perform_single_download(client, url)
-                outcomes.append(outcome)
+        try:
+            async with asyncio.timeout(settings.total_timeout_seconds):
+                async with httpx.AsyncClient(
+                    timeout=self._timeout,
+                    limits=limits,
+                    headers={"Accept-Encoding": "identity"},
+                    follow_redirects=False,
+                    transport=self._transport,
+                ) as client:
+                    for _ in range(requests_count):
+                        outcome = await _perform_single_download(client, url)
+                        outcomes.append(outcome)
+        except TimeoutError as exc:
+            raise SpeedTestTimeoutError(
+                f"Speed test exceeded the total time limit of {settings.total_timeout_seconds:g} s."
+            ) from exc
 
         return summarize(url, outcomes)
 

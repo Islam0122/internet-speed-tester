@@ -1,8 +1,10 @@
 services:
   app:
-    build: ../internet-speed-tester2
+    build: .
     ports:
       - "8000:8000"
+    # Optional: copy .env.example to .env to override settings.
     env_file:
-      - .env.example
+      - path: .env
+        required: false
     restart: unless-stopped

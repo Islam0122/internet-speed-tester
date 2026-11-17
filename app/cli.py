@@ -1,3 +1,23 @@
+"""Command-line interface for the sequential download speed test.
+
+The CLI is a thin layer over ``SpeedTester`` in ``app.services.speed_tester``.
+URL and request-count validation reuses ``SpeedTestRequest`` from
+``app.schemas.speed_test``, so the CLI and ``POST /api/speed-test`` share one
+code path.
+
+Usage::
+
+    python -m app.cli https://example.com/large-image.jpg
+    python -m app.cli https://example.com/large-image.jpg -n 10
+
+Exit codes:
+    0    every request succeeded
+    1    at least one request failed, or the test could not run (SSRF block,
+         total time limit exceeded, unexpected error)
+    2    invalid arguments (malformed URL, requests count out of range)
+    130  interrupted with Ctrl+C
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -9,11 +29,17 @@ from pydantic import ValidationError
 
 from app.config import settings
 from app.schemas.speed_test import SpeedTestRequest
-from app.services.speed_tester import SpeedTester, SpeedTestSummary, SSRFError
+from app.services.speed_tester import (
+    SpeedTester,
+    SpeedTestSummary,
+    SpeedTestTimeoutError,
+    SSRFError,
+)
 
 EXIT_OK = 0
 EXIT_FAILURE = 1
 EXIT_USAGE = 2
+EXIT_INTERRUPTED = 130  # 128 + SIGINT, the conventional code for Ctrl+C
 
 TesterFactory = Callable[[], SpeedTester]
 
@@ -118,8 +144,14 @@ def main(
 
     try:
         summary = asyncio.run(tester.run(request.url, request.requests_count))
+    except KeyboardInterrupt:
+        print("\nInterrupted by user. No report was produced.", file=sys.stderr)
+        return EXIT_INTERRUPTED
     except SSRFError as exc:
         print(f"Error: URL is not allowed: {exc}", file=sys.stderr)
+        return EXIT_FAILURE
+    except SpeedTestTimeoutError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
         return EXIT_FAILURE
     except Exception as exc:
         print(f"Error: speed test could not complete: {exc}", file=sys.stderr)

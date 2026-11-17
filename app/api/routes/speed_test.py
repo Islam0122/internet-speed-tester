@@ -7,7 +7,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.schemas.speed_test import RequestResult, SpeedTestRequest, SpeedTestResponse
-from app.services.speed_tester import SpeedTester, SSRFError
+from app.services.speed_tester import SpeedTester, SpeedTestTimeoutError, SSRFError
 
 logger = logging.getLogger("app.api.speed_test")
 
@@ -51,6 +51,11 @@ async def run_speed_test(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"URL is not allowed: {exc}",
+        ) from exc
+    except SpeedTestTimeoutError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail=str(exc),
         ) from exc
     except Exception as exc:  # noqa: BLE001 - guard against any unexpected failure.
         logger.exception("Unexpected error while running speed test for %s", payload.url)

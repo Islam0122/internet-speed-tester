@@ -50,12 +50,12 @@ class Settings:
         read_timeout_seconds: Timeout for reading each chunk of the response
             body. HTTPX resets this timer on each chunk received, so a slow
             but progressing download will not be killed by it.
+        total_timeout_seconds: Deadline for one complete test run (all
+            requests together). Exceeding it aborts the run with an error.
         max_response_bytes: Hard cap on how many bytes will be read from a
             single response. Protects the server from being used to download
             unbounded amounts of data. The download is aborted (and the
             request marked as failed) if this limit is exceeded.
-        max_redirects: Maximum number of HTTP redirects HTTPX will follow for
-            a single request.
         chunk_size_bytes: Size of each chunk read while streaming the
             response body.
         enable_ssrf_protection: Whether resolved IP addresses are checked
@@ -69,9 +69,9 @@ class Settings:
 
     connect_timeout_seconds: float = _get_float("CONNECT_TIMEOUT_SECONDS", 5.0)
     read_timeout_seconds: float = _get_float("READ_TIMEOUT_SECONDS", 15.0)
+    total_timeout_seconds: float = _get_float("TOTAL_TIMEOUT_SECONDS", 120.0)
 
     max_response_bytes: int = _get_int("MAX_RESPONSE_BYTES", 200 * 1024 * 1024)  # 200 MiB
-    max_redirects: int = _get_int("MAX_REDIRECTS", 5)
     chunk_size_bytes: int = _get_int("CHUNK_SIZE_BYTES", 64 * 1024)  # 64 KiB
 
     enable_ssrf_protection: bool = _get_bool("ENABLE_SSRF_PROTECTION", True)

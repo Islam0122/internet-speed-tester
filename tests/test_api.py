@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from app.api.routes.speed_test import get_speed_tester
 from app.main import app
 from app.services.speed_tester import SpeedTester
+from tests.helpers import streamed_response
 
 
 def _mock_tester(handler) -> SpeedTester:
@@ -36,7 +37,7 @@ def test_health_endpoint():
 
 def test_speed_test_success_response_schema():
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=b"x" * 1024)
+        return streamed_response(200, content=b"x" * 1024)
 
     app.dependency_overrides[get_speed_tester] = lambda: _mock_tester(handler)
     client = TestClient(app)
@@ -88,7 +89,7 @@ def test_speed_test_default_requests_count_is_ten():
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls["n"] += 1
-        return httpx.Response(200, content=b"y" * 100)
+        return streamed_response(200, content=b"y" * 100)
 
     app.dependency_overrides[get_speed_tester] = lambda: _mock_tester(handler)
     client = TestClient(app)
@@ -138,7 +139,7 @@ def test_speed_test_missing_url_rejected():
 
 def test_speed_test_handles_failed_requests_without_500():
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(503, content=b"unavailable")
+        return streamed_response(503, content=b"unavailable")
 
     app.dependency_overrides[get_speed_tester] = lambda: _mock_tester(handler)
     client = TestClient(app)
@@ -160,3 +161,48 @@ def test_index_page_served():
     response = client.get("/")
     assert response.status_code == 200
     assert "Internet Speed Tester" in response.text
+
+
+def test_speed_test_redirect_is_reported_not_followed():
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return streamed_response(302, headers={"Location": "http://169.254.169.254/"})
+
+    app.dependency_overrides[get_speed_tester] = lambda: _mock_tester(handler)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/speed-test",
+        json={"url": "https://example.com/file.bin", "requests_count": 1},
+    )
+
+    assert response.status_code == 200
+    assert seen == ["https://example.com/file.bin"]
+    assert response.json()["results"][0]["error"] == "Redirect not followed: HTTP 302"
+
+
+def test_speed_test_total_deadline_returns_504(monkeypatch):
+    from app.config import settings
+
+    class _SlowTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            import asyncio
+
+            await asyncio.sleep(0.5)
+            return streamed_response(200, content=b"late", request=request)
+
+    monkeypatch.setattr(settings, "total_timeout_seconds", 0.05)
+    app.dependency_overrides[get_speed_tester] = lambda: SpeedTester(
+        transport=_SlowTransport(), skip_ssrf_check=True
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/speed-test",
+        json={"url": "https://example.com/file.bin", "requests_count": 2},
+    )
+
+    assert response.status_code == 504
+    assert "total time limit" in response.json()["detail"]
