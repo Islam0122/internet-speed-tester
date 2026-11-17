@@ -6,12 +6,47 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
+from app.config import settings
 from app.schemas.speed_test import RequestResult, SpeedTestRequest, SpeedTestResponse
 from app.services.speed_tester import SpeedTester, SpeedTestTimeoutError, SSRFError
 
 logger = logging.getLogger("app.api.speed_test")
 
 router = APIRouter()
+
+
+class ConcurrencyLimiter:
+    """Admits at most ``limit`` speed tests at once and refuses the rest.
+
+    Requests are not queued. A queue would grow without bound under load, and
+    each test can take up to TOTAL_TIMEOUT_SECONDS, so waiting clients would
+    pile up. Refused requests get HTTP 429 immediately.
+
+    No lock is needed: asyncio runs on one thread, and ``try_acquire`` does not
+    await, so two coroutines cannot both take the last slot.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._active = 0
+
+    @property
+    def active(self) -> int:
+        return self._active
+
+    def try_acquire(self) -> bool:
+        if self._active >= self._limit:
+            return False
+        self._active += 1
+        return True
+
+    def release(self) -> None:
+        self._active -= 1
+
+
+# One process-wide limiter. The Docker image runs a single uvicorn worker, so
+# the limit applies to the whole service.
+_test_limiter = ConcurrencyLimiter(settings.max_concurrent_tests)
 
 
 def get_speed_tester() -> SpeedTester:
@@ -44,6 +79,11 @@ async def run_speed_test(
     Requests run one after another (not in parallel). The response contains
     both the aggregated statistics and each individual request's result.
     """
+    if not _test_limiter.try_acquire():
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Another speed test is already running. Try again later.",
+        )
     try:
         summary = await tester.run(payload.url, payload.requests_count)
     except SSRFError as exc:
@@ -63,6 +103,9 @@ async def run_speed_test(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An unexpected error occurred while running the speed test.",
         ) from exc
+    finally:
+        # Release on every path: success, error, timeout and cancellation.
+        _test_limiter.release()
 
     return SpeedTestResponse(
         url=summary.url,

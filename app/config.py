@@ -52,6 +52,8 @@ class Settings:
             but progressing download will not be killed by it.
         total_timeout_seconds: Deadline for one complete test run (all
             requests together). Exceeding it aborts the run with an error.
+        max_concurrent_tests: How many speed tests may run at the same time
+            through the API. Further requests get HTTP 429 without waiting.
         max_response_bytes: Hard cap on how many bytes will be read from a
             single response. Protects the server from being used to download
             unbounded amounts of data. The download is aborted (and the
@@ -70,6 +72,7 @@ class Settings:
     connect_timeout_seconds: float = _get_float("CONNECT_TIMEOUT_SECONDS", 5.0)
     read_timeout_seconds: float = _get_float("READ_TIMEOUT_SECONDS", 15.0)
     total_timeout_seconds: float = _get_float("TOTAL_TIMEOUT_SECONDS", 120.0)
+    max_concurrent_tests: int = _get_int("MAX_CONCURRENT_TESTS", 1)
 
     max_response_bytes: int = _get_int("MAX_RESPONSE_BYTES", 200 * 1024 * 1024)  # 200 MiB
     chunk_size_bytes: int = _get_int("CHUNK_SIZE_BYTES", 64 * 1024)  # 64 KiB
