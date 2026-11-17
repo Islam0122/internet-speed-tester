@@ -496,3 +496,92 @@ async def test_run_refuses_private_target_before_any_request():
         await tester.run("http://10.0.0.5/admin", requests_count=1)
 
     assert calls["n"] == 0
+
+
+# --- speed formulas with empty bodies -----------------------------------------
+
+
+def test_empty_successful_body_is_excluded_from_average_speed():
+    """1 MiB in 1 s plus an empty body in 1 s.
+
+    average_speed uses only the request that carried data: 1.0 MiB/s.
+    average_time still covers both successful requests: (1 + 1) / 2 = 1.0 s.
+    overall_speed keeps its definition: 1 MiB over 2 s total = 0.5 MiB/s.
+    """
+    outcomes = [
+        SingleRequestOutcome(True, 200, 1.0, 1024 * 1024, None),
+        SingleRequestOutcome(True, 200, 1.0, 0, None),
+    ]
+    summary = summarize("https://example.com/file.bin", outcomes)
+
+    assert summary.successful_requests == 2
+    assert summary.average_time_seconds == pytest.approx(1.0)
+    assert summary.average_speed_mib_s == pytest.approx(1.0)
+    assert summary.overall_speed_mib_s == pytest.approx(0.5)
+
+
+def test_all_successful_bodies_empty_gives_zero_speeds_and_no_division_error():
+    outcomes = [
+        SingleRequestOutcome(True, 200, 0.5, 0, None),
+        SingleRequestOutcome(True, 200, 0.5, 0, None),
+    ]
+    summary = summarize("https://example.com/file.bin", outcomes)
+
+    assert summary.successful_requests == 2
+    assert summary.total_bytes == 0
+    assert summary.average_speed_mib_s == 0.0
+    assert summary.overall_speed_mib_s == 0.0
+    assert summary.average_time_seconds == pytest.approx(0.5)
+
+
+@pytest.mark.asyncio
+async def test_all_requests_with_empty_bodies_end_to_end():
+    tester = SpeedTester(transport=httpx.MockTransport(_empty_handler), skip_ssrf_check=True)
+    summary = await tester.run("https://example.com/file.bin", requests_count=3)
+
+    assert summary.successful_requests == 3
+    assert summary.total_bytes == 0
+    assert summary.average_speed_mib_s == 0.0
+    assert summary.overall_speed_mib_s == 0.0
+
+
+# --- DNS check inside the total deadline --------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_slow_dns_is_bounded_by_total_deadline(monkeypatch):
+    """A resolver that hangs for 2 s must not keep the run alive past a 0.2 s deadline."""
+    import time
+
+    monkeypatch.setattr(settings, "enable_ssrf_protection", True)
+    monkeypatch.setattr(settings, "total_timeout_seconds", 0.2)
+
+    dns_calls = {"n": 0}
+
+    async def slow_getaddrinfo(*args, **kwargs):
+        dns_calls["n"] += 1
+        await asyncio.sleep(2.0)
+        return []
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", slow_getaddrinfo)
+
+    tester = SpeedTester(transport=httpx.MockTransport(_ok_handler))  # SSRF check ON
+    started = time.perf_counter()
+    with pytest.raises(SpeedTestTimeoutError, match="total time limit of 0.2 s"):
+        await tester.run("http://example.com/file.bin", requests_count=1)
+    elapsed = time.perf_counter() - started
+
+    assert dns_calls["n"] == 1  # the DNS check did start
+    assert elapsed < 1.0  # ...but was cut off at the deadline, not after 2 s
+
+
+@pytest.mark.asyncio
+async def test_dns_failure_inside_deadline_is_still_an_ssrf_error(monkeypatch):
+    """A quick DNS failure keeps its SSRF error type; it is not turned into a timeout."""
+    monkeypatch.setattr(settings, "enable_ssrf_protection", True)
+    monkeypatch.setattr(settings, "total_timeout_seconds", 5.0)
+
+    tester = SpeedTester(transport=httpx.MockTransport(_ok_handler))
+    with pytest.raises(SSRFError, match="Could not resolve host"):
+        await tester.run("http://nonexistent.invalid/file.bin", requests_count=1)

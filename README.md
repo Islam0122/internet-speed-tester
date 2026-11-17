@@ -262,7 +262,8 @@ Response (abbreviated):
 | `200` | The test ran. Individual requests may still have failed, see `results`. |
 | `400` | The target was rejected by the SSRF guard. |
 | `422` | Invalid input: malformed URL, unsupported scheme, `requests_count` out of range. |
-| `504` | The whole test exceeded `TOTAL_TIMEOUT_SECONDS`. |
+| `429` | Another speed test is already running (see `MAX_CONCURRENT_TESTS`). The request is refused at once, not queued. |
+| `504` | The whole test exceeded `TOTAL_TIMEOUT_SECONDS`, including the DNS check. |
 | `500` | Unexpected server error. The details are logged on the server, not returned. |
 
 ---
@@ -271,10 +272,20 @@ Response (abbreviated):
 
 - **What is measured:** for each request, `time.perf_counter()` starts just before the GET is sent and stops after the *entire response body* has been received. This is full download time, not latency.
 - **How bytes are counted:** the client requests `Accept-Encoding: identity`, and bytes are counted from the raw body as received. The count is the amount that crossed the network, never `Content-Length`. If a server compresses the body anyway, the count is the compressed size, not the decompressed size, so speed reflects the network and not the decompression.
-- **Average request time:** `sum(duration of successful requests) / successful count`. Failed requests are excluded.
-- **Per-request speed:** `size_mib / duration_seconds`. `0.0` if the duration is zero.
-- **Average speed (`average_speed_mib_s`):** mean of each successful request's per-request speed. Every request has equal weight.
-- **Overall throughput (`overall_speed_mib_s`):** `total_size_mib / total_time_seconds` over successful requests, treated as one continuous transfer. This is usually the more representative figure when request sizes or durations differ.
+- **Average request time (`average_time_seconds`):** `sum(duration of successful requests) / successful count`. Failed requests are excluded. Successful requests with an empty body are included.
+- **Per-request speed (`speed_mib_s`):** `size_mib / duration_seconds`. `0.0` for failed requests, and `0.0` if the duration is zero.
+- **Average speed (`average_speed_mib_s`):** mean of `speed_mib_s` over successful requests that downloaded **at least one byte**. A successful request with an empty body has no meaningful speed, so it is left out of this mean. `0.0` when no request downloaded any bytes.
+- **Overall throughput (`overall_speed_mib_s`):** `total_size_mib / total_time_seconds` over successful requests, treated as one continuous transfer. Empty successful requests add to the time but not to the size, so they lower this figure. `0.0` when `total_time_seconds` is zero or no bytes were received. This is usually the more representative figure when request sizes or durations differ.
+
+**Worked example.** One request downloads 1 MiB in 1 s, and a second successful request returns an empty body in 1 s:
+
+| Field | Value | Why |
+|---|---|---|
+| `average_time_seconds` | `1.0` | (1 + 1) / 2 successful requests |
+| `average_speed_mib_s` | `1.0` | Only the 1 MiB request counts: 1 / 1 |
+| `overall_speed_mib_s` | `0.5` | 1 MiB / (1 s + 1 s) |
+
+The two speed figures differ on purpose: one is the mean per-request speed, the other is throughput over the whole run.
 - **MiB, not MB:** all sizes and speeds use binary mebibytes (MiB = 1024 × 1024 bytes). Field names carry `_mib` to make this explicit.
 - **Failed transfers:** an aborted or truncated response is a failed request. Its partial bytes are shown for that request but are not included in totals.
 
@@ -291,7 +302,7 @@ Response (abbreviated):
 | Connection lost during the body | Failed, with a connection error. The partial bytes are not counted in totals. |
 | Body larger than `MAX_RESPONSE_BYTES` | Failed as soon as the cap is exceeded. The rest of the body is not read. |
 | Empty body (`200` with 0 bytes) | Successful, with 0 bytes and speed 0. |
-| Whole run exceeds `TOTAL_TIMEOUT_SECONDS` | The run is aborted. The API returns `504`, the CLI exits with `1`. |
+| Whole run exceeds `TOTAL_TIMEOUT_SECONDS` (including the DNS check) | The run is aborted. The API returns `504`, the CLI exits with `1`. |
 
 **Redirects are not followed**, on purpose. Following them would let a public URL
 redirect the server to an internal address after the SSRF check had already passed.
@@ -311,14 +322,15 @@ on the caller's behalf, which is a classic SSRF vector. The following measures a
   - an IPv4-mapped IPv6 address whose IPv4 part falls in any of these ranges (for example `::ffff:127.0.0.1`).
 - **Redirects are not followed**, so the check applies to the exact URL the client asked for. There is no redirect path to an internal address.
 - **Size cap:** a response is aborted when it exceeds `MAX_RESPONSE_BYTES` (default 200 MiB).
-- **Timeouts:** connect and read timeouts per request, and `TOTAL_TIMEOUT_SECONDS` for the whole run.
+- **Timeouts:** connect and read timeouts per request, and `TOTAL_TIMEOUT_SECONDS` for the whole run. The deadline also covers the DNS check, so a slow resolver cannot extend a run.
+- **Concurrency limit:** the API runs at most `MAX_CONCURRENT_TESTS` tests at once (default 1). Further requests get `429` immediately and are not queued. This limits the amplification described below. The limit applies per process, and the Docker image runs a single worker.
 - Errors returned to clients are generic. Stack traces are logged on the server only.
 
 ### Known limitations of the SSRF guard
 
 - **DNS rebinding is not prevented.** The hostname is resolved once for the check, and the HTTP client resolves it again when it connects. A DNS server that answers with a public address for the check and a private address for the connection gets past the guard. Closing this needs the connection pinned to the checked IP address, which is not implemented.
 - The guard is a **defence-in-depth measure**, not a complete control.
-- **There is no authentication and no rate limiting.** Each API call can make the server download up to `MAX_REQUESTS_COUNT × MAX_RESPONSE_BYTES` (50 × 200 MiB = 10 GiB) and calls can run in parallel. Do not expose this service to untrusted users without adding limits in front of it.
+- **There is no authentication and no request-rate limit.** Concurrent tests are capped by `MAX_CONCURRENT_TESTS`, but one test can still make the server download up to `MAX_REQUESTS_COUNT × MAX_RESPONSE_BYTES` (50 × 200 MiB = 10 GiB), and clients can run tests back to back. Do not expose this service to untrusted users without adding authentication and rate limits in front of it.
 - `ENABLE_SSRF_PROTECTION=false` disables the guard. Use it only for local testing.
 
 ---
@@ -333,7 +345,8 @@ Settings are read from environment variables (see `.env.example`).
 | `MAX_REQUESTS_COUNT` | `50` | Upper bound for `requests_count`. |
 | `CONNECT_TIMEOUT_SECONDS` | `5.0` | Timeout for establishing a connection. |
 | `READ_TIMEOUT_SECONDS` | `15.0` | Maximum wait for each chunk of the body. |
-| `TOTAL_TIMEOUT_SECONDS` | `120.0` | Deadline for the whole run. |
+| `TOTAL_TIMEOUT_SECONDS` | `120.0` | Deadline for the whole run, including the DNS check. |
+| `MAX_CONCURRENT_TESTS` | `1` | Speed tests the API runs at once. Extra requests get `429`. |
 | `MAX_RESPONSE_BYTES` | `209715200` (200 MiB) | Size cap for one response. |
 | `CHUNK_SIZE_BYTES` | `65536` (64 KiB) | Read size while streaming a body. |
 | `ENABLE_SSRF_PROTECTION` | `true` | Enables the SSRF guard. |
@@ -356,8 +369,9 @@ A negative control confirms that this detector does catch overlapping requests.
 Covered scenarios: a successful download, ten sequential requests, byte counting independent of
 `Content-Length`, gzip responses, identity encoding in requests, redirects (not followed, and
 not requested even with the SSRF guard on), HTTP errors, timeouts, connection errors, connection
-dropped mid-body, the size cap, the total deadline, empty bodies, all requests failing, SSRF
-address ranges, CLI exit codes, output and Ctrl+C, and API status codes.
+dropped mid-body, the size cap, the total deadline (including a slow DNS check), empty bodies,
+all requests failing, the speed formulas with empty bodies, SSRF address ranges, CLI exit codes,
+output and Ctrl+C, API status codes, and the concurrency limit (`429` for a second simultaneous request).
 
 ---
 

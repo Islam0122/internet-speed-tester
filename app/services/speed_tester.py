@@ -241,14 +241,16 @@ class SpeedTester:
             SSRFError: if the host resolves to a disallowed IP address.
             SpeedTestTimeoutError: if the whole test exceeds TOTAL_TIMEOUT_SECONDS.
         """
-        if not self._skip_ssrf_check:
-            await check_host_is_public(url)
-
         outcomes: list[SingleRequestOutcome] = []
 
         limits = httpx.Limits(max_connections=1, max_keepalive_connections=1)
         try:
+            # The DNS check is inside the deadline: a slow resolver must not
+            # extend the run beyond TOTAL_TIMEOUT_SECONDS.
             async with asyncio.timeout(settings.total_timeout_seconds):
+                if not self._skip_ssrf_check:
+                    await check_host_is_public(url)
+
                 async with httpx.AsyncClient(
                     timeout=self._timeout,
                     limits=limits,
@@ -307,8 +309,9 @@ def summarize(url: str, outcomes: list[SingleRequestOutcome]) -> SpeedTestSummar
     Calculation methodology:
     * average_time_seconds: mean of duration_seconds over SUCCESSFUL requests
       only. Failed requests do not contribute a meaningful download duration.
-    * average_speed_mib_s: mean of each successful request's own
-      speed_mib_s. This treats every request as an equally weighted sample.
+    * average_speed_mib_s: mean of the speed_mib_s of successful requests that
+      downloaded at least one byte. Empty successful bodies are excluded
+      because they have no meaningful speed.
     * overall_speed_mib_s: total_size_mib / total_time_seconds - i.e. all
       successful downloads treated as one continuous transfer. This differs
       from average_speed_mib_s when request sizes/durations are uneven, and
@@ -342,9 +345,11 @@ def summarize(url: str, outcomes: list[SingleRequestOutcome]) -> SpeedTestSummar
     total_time = sum(r.duration_seconds for r in successful)
 
     average_time = (total_time / len(successful)) if successful else 0.0
-    average_speed = (
-        (sum(r.speed_mib_s for r in successful) / len(successful)) if successful else 0.0
-    )
+
+    # A successful request with an empty body has no meaningful speed. Counting
+    # its 0 MiB/s would pull the average down, so it is left out of this mean.
+    with_data = [r for r in successful if r.bytes_downloaded > 0]
+    average_speed = (sum(r.speed_mib_s for r in with_data) / len(with_data)) if with_data else 0.0
     overall_speed = _speed_mib_s(total_bytes, total_time)
 
     return SpeedTestSummary(

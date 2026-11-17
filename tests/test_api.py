@@ -6,10 +6,13 @@ FastAPI's dependency override system, so no real network access is needed.
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from app.api.routes import speed_test as speed_route
 from app.api.routes.speed_test import get_speed_tester
 from app.main import app
 from app.services.speed_tester import SpeedTester
@@ -206,3 +209,108 @@ def test_speed_test_total_deadline_returns_504(monkeypatch):
 
     assert response.status_code == 504
     assert "total time limit" in response.json()["detail"]
+
+
+# --- concurrency limit --------------------------------------------------------
+
+
+def test_busy_limiter_returns_429_and_does_not_run_the_test(monkeypatch):
+    limiter = speed_route.ConcurrencyLimiter(1)
+    assert limiter.try_acquire() is True  # another request holds the only slot
+    monkeypatch.setattr(speed_route, "_test_limiter", limiter)
+
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return streamed_response(200, content=b"x")
+
+    app.dependency_overrides[get_speed_tester] = lambda: _mock_tester(handler)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/speed-test", json={"url": "https://example.com/file.bin", "requests_count": 1}
+    )
+
+    assert response.status_code == 429
+    assert "already running" in response.json()["detail"]
+    assert calls["n"] == 0  # the refused request never touched the network
+    assert limiter.active == 1  # and it did not release the other request's slot
+
+
+def test_slot_is_released_after_a_successful_run(monkeypatch):
+    limiter = speed_route.ConcurrencyLimiter(1)
+    monkeypatch.setattr(speed_route, "_test_limiter", limiter)
+
+    app.dependency_overrides[get_speed_tester] = lambda: _mock_tester(
+        lambda request: streamed_response(200, content=b"x")
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/speed-test", json={"url": "https://example.com/file.bin", "requests_count": 1}
+    )
+
+    assert response.status_code == 200
+    assert limiter.active == 0
+
+
+def test_slot_is_released_after_a_timeout(monkeypatch):
+    from app.config import settings
+
+    class _SlowTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            await asyncio.sleep(0.5)
+            return streamed_response(200, content=b"late", request=request)
+
+    limiter = speed_route.ConcurrencyLimiter(1)
+    monkeypatch.setattr(speed_route, "_test_limiter", limiter)
+    monkeypatch.setattr(settings, "total_timeout_seconds", 0.05)
+    app.dependency_overrides[get_speed_tester] = lambda: SpeedTester(
+        transport=_SlowTransport(), skip_ssrf_check=True
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/speed-test", json={"url": "https://example.com/file.bin", "requests_count": 1}
+    )
+
+    assert response.status_code == 504
+    assert limiter.active == 0  # released even though the run failed
+
+
+def test_limiter_unit_behaviour():
+    limiter = speed_route.ConcurrencyLimiter(2)
+    assert limiter.try_acquire() and limiter.try_acquire()
+    assert limiter.try_acquire() is False  # full: refuse, never queue
+    assert limiter.active == 2
+    limiter.release()
+    assert limiter.try_acquire() is True
+
+
+@pytest.mark.asyncio
+async def test_two_simultaneous_requests_one_is_refused(monkeypatch):
+    """Real concurrency through the ASGI app: the second request gets 429 at once."""
+
+    class _SlowTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            await asyncio.sleep(0.2)
+            return streamed_response(200, content=b"data", request=request)
+
+    limiter = speed_route.ConcurrencyLimiter(1)
+    monkeypatch.setattr(speed_route, "_test_limiter", limiter)
+    app.dependency_overrides[get_speed_tester] = lambda: SpeedTester(
+        transport=_SlowTransport(), skip_ssrf_check=True
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        body = {"url": "https://example.com/file.bin", "requests_count": 2}
+        first, second = await asyncio.gather(
+            client.post("/api/speed-test", json=body),
+            client.post("/api/speed-test", json=body),
+        )
+
+    statuses = sorted([first.status_code, second.status_code])
+    assert statuses == [200, 429]
+    assert limiter.active == 0
