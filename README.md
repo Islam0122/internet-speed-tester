@@ -260,8 +260,8 @@ Response (abbreviated):
 | Code | When |
 |---|---|
 | `200` | The test ran. Individual requests may still have failed, see `results`. |
-| `400` | The target was rejected by the SSRF guard. |
-| `422` | Invalid input: malformed URL, unsupported scheme, `requests_count` out of range. |
+| `400` | The target was rejected by the SSRF guard. The response only says the URL is not allowed. The CLI shows the reason. |
+| `422` | Invalid input: malformed URL, unsupported scheme, whitespace in the URL, a username or password in the URL, `requests_count` out of range. |
 | `429` | Another speed test is already running (see `MAX_CONCURRENT_TESTS`). The request is refused at once, not queued. |
 | `504` | The whole test exceeded `TOTAL_TIMEOUT_SECONDS`, including the DNS check. |
 | `500` | Unexpected server error. The details are logged on the server, not returned. |
@@ -316,6 +316,7 @@ The target URL is **untrusted input**. The endpoint makes the server send reques
 on the caller's behalf, which is a classic SSRF vector. The following measures are implemented.
 
 - Only `http://` and `https://` URLs are accepted (validated by Pydantic).
+- URLs must not contain whitespace, and must not contain a username or password (`user:pass@host`). Such a URL is rejected with `422`, so credentials are never sent to the target.
 - **SSRF guard:** before the first request, the hostname is resolved (without blocking the event loop) and every returned address is checked. Requests are refused if any address is:
   - private, loopback, link-local, multicast, reserved or unspecified (`ipaddress` checks, which include `169.254.169.254`, the AWS/GCP/Azure metadata address);
   - in one of these ranges that `ipaddress` does not always cover: `100.64.0.0/10` (carrier-grade NAT, which hosts Alibaba Cloud metadata at `100.100.100.200`), `198.18.0.0/15` (benchmarking), `192.0.0.0/24` (IETF assignments), `240.0.0.0/4` (reserved);
@@ -324,7 +325,12 @@ on the caller's behalf, which is a classic SSRF vector. The following measures a
 - **Size cap:** a response is aborted when it exceeds `MAX_RESPONSE_BYTES` (default 200 MiB).
 - **Timeouts:** connect and read timeouts per request, and `TOTAL_TIMEOUT_SECONDS` for the whole run. The deadline also covers the DNS check, so a slow resolver cannot extend a run.
 - **Concurrency limit:** the API runs at most `MAX_CONCURRENT_TESTS` tests at once (default 1). Further requests get `429` immediately and are not queued. This limits the amplification described below. The limit applies per process, and the Docker image runs a single worker.
-- Errors returned to clients are generic. Stack traces are logged on the server only.
+- **Error exposure.** What a client can see:
+  - SSRF rejection (`400`): a generic message only. The resolved address and the resolver's error text are not returned. The CLI still prints the reason, because the CLI runs on the user's machine.
+  - Unexpected server error (`500`): a generic message. The stack trace is logged on the server only.
+  - Per-request failure: a short label such as `HTTP error: 404`, `Timeout: …` or `Connection error: …`. An unexpected exception inside a request appears only as `Unexpected error`, with the details in the server log.
+  - The response's `url` field echoes the URL the client sent, including its query string.
+- **Logs** never contain the username, password, query string or fragment of a URL. Those parts are removed before logging, because query strings often carry signed tokens.
 
 ### Known limitations of the SSRF guard
 
@@ -341,7 +347,7 @@ Settings are read from environment variables (see `.env.example`).
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `DEFAULT_REQUESTS_COUNT` | `10` | Requests performed when `requests_count` is not given. |
+| `DEFAULT_REQUESTS_COUNT` | `10` | Default for the **API** when `requests_count` is not given. The CLI always runs 10 requests unless `-n` is passed. |
 | `MAX_REQUESTS_COUNT` | `50` | Upper bound for `requests_count`. |
 | `CONNECT_TIMEOUT_SECONDS` | `5.0` | Timeout for establishing a connection. |
 | `READ_TIMEOUT_SECONDS` | `15.0` | Maximum wait for each chunk of the body. |

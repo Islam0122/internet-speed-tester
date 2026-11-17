@@ -25,17 +25,31 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import logging
 import socket
 import time
 from contextlib import aclosing
 from dataclasses import dataclass
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 import httpx
 
 from app.config import settings
 
 BYTES_PER_MIB = 1024 * 1024
+
+logger = logging.getLogger("app.services.speed_tester")
+
+
+def redact_url(url: str) -> str:
+    """Return the URL without userinfo, query string and fragment, for logs.
+
+    Query strings often carry signed tokens, so they are never logged.
+    """
+    parts = urlsplit(url)
+    host_and_port = parts.netloc.rsplit("@", 1)[-1]
+    return f"{parts.scheme}://{host_and_port}{parts.path}"
+
 
 # Ranges that must not be treated as public. ``ipaddress.is_private`` does not
 # cover all of them (for example the carrier-grade NAT range, which hosts the
@@ -199,14 +213,16 @@ async def _perform_single_download(client: httpx.AsyncClient, url: str) -> Singl
             bytes_downloaded=bytes_downloaded,
             error=f"Connection error: {exc}",
         )
-    except Exception as exc:  # noqa: BLE001 - a single failed request must not crash the run.
+    except Exception:  # noqa: BLE001 - a single failed request must not crash the run.
+        # Internal details stay in the server log. The client gets a generic message.
+        logger.exception("Unexpected error while downloading %s", redact_url(url))
         duration = time.perf_counter() - start
         return SingleRequestOutcome(
             success=False,
             status_code=status_code,
             duration_seconds=duration,
             bytes_downloaded=bytes_downloaded,
-            error=f"Unexpected error: {exc}",
+            error="Unexpected error",
         )
 
 

@@ -41,6 +41,10 @@ EXIT_FAILURE = 1
 EXIT_USAGE = 2
 EXIT_INTERRUPTED = 130  # 128 + SIGINT, the conventional code for Ctrl+C
 
+# The assignment fixes the standard run at 10 requests. DEFAULT_REQUESTS_COUNT
+# changes only the API default, so the CLI always does 10 unless -n is given.
+CLI_DEFAULT_REQUESTS = 10
+
 TesterFactory = Callable[[], SpeedTester]
 
 
@@ -59,10 +63,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--requests",
         dest="requests_count",
         type=int,
-        default=settings.default_requests_count,
+        default=CLI_DEFAULT_REQUESTS,
         help=(
             "number of sequential requests to perform "
-            f"(default: {settings.default_requests_count}, max: {settings.max_requests_count})"
+            f"(default: {CLI_DEFAULT_REQUESTS}, max: {settings.max_requests_count})"
         ),
     )
     return parser

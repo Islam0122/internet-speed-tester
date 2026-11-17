@@ -314,3 +314,75 @@ async def test_two_simultaneous_requests_one_is_refused(monkeypatch):
     statuses = sorted([first.status_code, second.status_code])
     assert statuses == [200, 429]
     assert limiter.active == 0
+
+
+# --- URL validation and error exposure ---------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "https://exa mple.com/file.bin",  # space inside the host
+        "https://example.com/my file.bin",  # space in the path
+        "https://user:secret@example.com/file.bin",  # username and password
+        "https://user@example.com/file.bin",  # username only
+        "https://@example.com/file.bin",  # empty userinfo
+    ],
+)
+def test_url_with_whitespace_or_userinfo_is_rejected(bad_url):
+    client = TestClient(app)
+    response = client.post("/api/speed-test", json={"url": bad_url, "requests_count": 1})
+
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "url"]
+
+
+def test_ssrf_detail_does_not_reveal_resolved_address():
+    client = TestClient(app)
+    response = client.post(
+        "/api/speed-test", json={"url": "http://127.0.0.1/file.bin", "requests_count": 1}
+    )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "127.0.0.1" not in detail
+    assert "resolves" not in detail
+    assert detail.startswith("URL is not allowed")
+
+
+def test_unexpected_error_response_and_log_do_not_leak_the_query_token(caplog):
+    secret = "tok_SECRET_123"
+
+    class _ExplodingTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            raise RuntimeError("internal failure detail")
+
+    app.dependency_overrides[get_speed_tester] = lambda: SpeedTester(
+        transport=_ExplodingTransport(), skip_ssrf_check=True
+    )
+    client = TestClient(app, raise_server_exceptions=False)
+
+    with caplog.at_level("ERROR"):
+        response = client.post(
+            "/api/speed-test",
+            json={"url": f"https://example.com/file.bin?token={secret}", "requests_count": 1},
+        )
+
+    # The per-request error is generic: the exception text stays on the server.
+    # (The response's "url" field echoes the URL the client sent, so the client
+    # still sees its own token there; only logs are redacted.)
+    assert response.status_code == 200
+    assert response.json()["results"][0]["error"] == "Unexpected error"
+    assert "internal failure detail" not in response.text
+    # The server log has the URL without its query string.
+    assert secret not in caplog.text
+    assert "https://example.com/file.bin" in caplog.text
+
+
+def test_redact_url_removes_userinfo_query_and_fragment():
+    from app.services.speed_tester import redact_url
+
+    assert redact_url("https://example.com/a/b.bin?token=SECRET#frag") == (
+        "https://example.com/a/b.bin"
+    )
+    assert redact_url("http://user:pw@example.com:8080/f") == "http://example.com:8080/f"
