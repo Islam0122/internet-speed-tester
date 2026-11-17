@@ -49,11 +49,13 @@ internet-speed-tester/
 │   │   └── speed_test.py          # /health and /api/speed-test routes (thin controllers)
 │   ├── services/
 │   │   └── speed_tester.py        # Core logic: sequential downloads, SSRF guard, metrics
+│   ├── cli.py                     # Console entry point (argparse), reuses SpeedTester
 │   └── static/                    # index.html, style.css, app.js (the dashboard)
 │
 ├── tests/
 │   ├── test_speed_tester.py       # Unit tests for the service layer (mocked transport)
-│   └── test_api.py                # API integration tests (FastAPI TestClient)
+│   ├── test_api.py                # API integration tests (FastAPI TestClient)
+│   └── test_cli.py                # CLI tests (mocked transport, exit codes, output)
 │
 ├── requirements.txt
 ├── pyproject.toml                 # Ruff + pytest configuration
@@ -166,6 +168,64 @@ target), the API returns `400` or `422` with a `detail` message — never a raw
 stack trace.
 
 ---
+
+## CLI usage
+
+The same download logic is available as a console command, without starting
+the web server. It runs **10 sequential HTTP GET requests by default**, waits
+for each response to be fully downloaded, and prints timings and throughput.
+
+```bash
+python -m app.cli https://example.com/large-image.jpg
+```
+
+Options:
+
+| Option | Description |
+|---|---|
+| `url` (required) | HTTP or HTTPS URL of the file to download. |
+| `-n N`, `--requests N` | Number of sequential requests. Default: `10`. Range: `1`–`50`. |
+| `-h`, `--help` | Show usage. |
+
+Example output (numbers are illustrative):
+
+```
+URL: https://example.com/large-image.jpg
+
+Request  1: 0.412 s, 5.00 MiB, 12.14 MiB/s
+Request  2: 0.398 s, 5.00 MiB, 12.56 MiB/s
+...
+Request 10: 0.405 s, 5.00 MiB, 12.35 MiB/s
+
+Requests: 10 total, 10 successful, 0 failed
+Average request time: 0.405 s
+Total downloaded: 50.00 MiB (52428800 bytes)
+Total download time: 4.050 s
+Average speed: 12.33 MiB/s
+Overall speed: 12.35 MiB/s
+```
+
+**Units:** all times are in seconds (`s`), sizes in binary mebibytes (`MiB`,
+1 MiB = 1024 × 1024 bytes), and speeds in `MiB/s`. `Average speed` is the mean
+of the per-request speeds; `Overall speed` is total downloaded size divided by
+total download time. Both are defined in
+[Calculation methodology](#calculation-methodology).
+
+**Exit codes:**
+
+| Code | Meaning |
+|---|---|
+| `0` | All requests succeeded. |
+| `1` | At least one request failed, or the test could not run (for example, the URL was blocked by the SSRF guard). |
+| `2` | Invalid arguments (malformed URL, or `-n` outside `1`–`50`). |
+
+Failed requests are listed as `FAILED (reason)` in the output. The run
+continues past individual failures and the summary is still printed, but the
+exit code is `1`. When every request fails, average values are shown as `n/a`.
+
+The CLI uses the same SSRF protection, size cap, timeouts and environment
+settings as the API (see [Security](#security) and `.env.example`). To test a
+local resource, set `ENABLE_SSRF_PROTECTION=false`.
 
 ## Calculation methodology
 
